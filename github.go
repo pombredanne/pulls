@@ -1,26 +1,36 @@
-package pulls
+package gordon
 
 import (
 	"encoding/json"
 	"fmt"
-	gh "github.com/crosbymichael/octokat"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+
+	gh "github.com/crosbymichael/octokat"
 )
 
 // Top level type that manages a repository
-type Maintainer struct {
-	repo   gh.Repo
-	client *gh.Client
+type MaintainerManager struct {
+	repo       gh.Repo
+	client     *gh.Client
+	email      string
+	username   string
+	originPath string
 }
 
 type Config struct {
-	Token string
+	Token    string
+	UserName string
 }
 
-var configPath = path.Join(os.Getenv("HOME"), ".maintainercfg")
+var (
+	belongsToOthers = false
+	configPath      = path.Join(os.Getenv("HOME"), ".maintainercfg")
+)
 
 func LoadConfig() (*Config, error) {
 	var config Config
@@ -43,7 +53,7 @@ func LoadConfig() (*Config, error) {
 func SaveConfig(config Config) error {
 	f, err := os.OpenFile(configPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return nil
+		return err
 	}
 	defer f.Close()
 
@@ -54,28 +64,133 @@ func SaveConfig(config Config) error {
 	return nil
 }
 
-func NewMaintainer(client *gh.Client, org, repo string) (*Maintainer, error) {
+func getRepoPath(pth, org string) string {
+	flag := false
+	i := 0
+	repoPath := path.Dir("/")
+	for _, dir := range strings.Split(pth, "/") {
+		if strings.EqualFold(dir, org) {
+			flag = true
+		}
+		if flag {
+			if i >= 2 {
+				repoPath = path.Join(repoPath, dir)
+			}
+			i++
+		}
+	}
+	return repoPath
+}
 
+func getOriginPath(repo string) (string, error) {
+	currentPath, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	originPath := path.Dir("/")
+	for _, dir := range strings.Split(currentPath, "/") {
+		originPath = path.Join(originPath, dir)
+		if strings.EqualFold(dir, repo) {
+			break
+		}
+	}
+	return originPath, err
+}
+
+func NewMaintainerManager(client *gh.Client, org, repo string) (*MaintainerManager, error) {
 	config, err := LoadConfig()
 	if err == nil {
 		client.WithToken(config.Token)
 	}
-
-	return &Maintainer{
-		repo:   gh.Repo{Name: repo, UserName: org},
-		client: client,
+	originPath, err := getOriginPath(repo)
+	if err != nil {
+		return nil, fmt.Errorf("getoriginpath: %v", err)
+	}
+	email, err := GetMaintainerManagerEmail()
+	if err != nil {
+		return nil, fmt.Errorf("getemail: %v", err)
+	}
+	return &MaintainerManager{
+		repo:       gh.Repo{Name: repo, UserName: org},
+		client:     client,
+		email:      email,
+		originPath: originPath,
+		username:   config.UserName,
 	}, nil
 }
 
-func (m *Maintainer) Repository() (*gh.Repository, error) {
+func (m *MaintainerManager) Repository() (*gh.Repository, error) {
 	return m.client.Repository(m.repo, nil)
 }
 
+func (m *MaintainerManager) worker(prepr <-chan *gh.PullRequest, pospr chan<- *gh.PullRequest, wg *sync.WaitGroup, needFullPr, needComments bool) {
+	var err error
+	defer wg.Done()
+
+	for p := range prepr {
+		if needFullPr {
+			p, err = m.GetPullRequest(strconv.Itoa(p.Number))
+			if err != nil {
+				return
+			}
+		}
+		if needComments {
+			p.CommentsBody, err = m.GetComments(strconv.Itoa(p.Number))
+			if err != nil {
+				return
+			}
+		}
+		pospr <- p
+		fmt.Printf(".")
+	}
+}
+
+func (m *MaintainerManager) GetFullPullRequests(prs []*gh.PullRequest, needFullPr, needComments bool) []*gh.PullRequest {
+	var (
+		producer      = make(chan *gh.PullRequest, NumWorkers)
+		consumer      = make(chan *gh.PullRequest, NumWorkers)
+		wg            = &sync.WaitGroup{}
+		consumerGroup = &sync.WaitGroup{}
+		filteredPrs   = []*gh.PullRequest{}
+	)
+
+	// take the finished results and put them into the list
+	consumerGroup.Add(1)
+	go func() {
+		defer consumerGroup.Done()
+
+		for p := range consumer {
+			filteredPrs = append(filteredPrs, p)
+		}
+	}()
+
+	for i := 0; i < NumWorkers; i++ {
+		wg.Add(1)
+		go m.worker(producer, consumer, wg, needFullPr, needComments)
+	}
+
+	// add all jobs
+	for _, p := range prs {
+		producer <- p
+	}
+	// we are done sending jobs so close the channel
+	close(producer)
+
+	wg.Wait()
+
+	close(consumer)
+	// wait for the consumer to finish adding all the results to the list
+	consumerGroup.Wait()
+
+	return filteredPrs
+}
+
 // Return all pull requests
-func (m *Maintainer) GetPullRequests(state string) ([]*gh.PullRequest, error) {
+func (m *MaintainerManager) GetPullRequests(state, sort string) ([]*gh.PullRequest, error) {
 	o := &gh.Options{}
 	o.QueryParams = map[string]string{
-		"sort":      "updated",
+		"sort":      sort,
 		"direction": "asc",
 		"state":     state,
 		"per_page":  "100",
@@ -97,7 +212,22 @@ func (m *Maintainer) GetPullRequests(state string) ([]*gh.PullRequest, error) {
 	return allPRs, nil
 }
 
-func (m *Maintainer) GetFirstPullRequest(state, sortBy string) (*gh.PullRequest, error) {
+// Return all pull request Files
+func (m *MaintainerManager) GetPullRequestFiles(number string) ([]*gh.PullRequestFile, error) {
+	o := &gh.Options{}
+	o.QueryParams = map[string]string{}
+	allPrFiles := []*gh.PullRequestFile{}
+
+	if prfs, err := m.client.PullRequestFiles(m.repo, number, o); err != nil {
+		return nil, err
+	} else {
+		allPrFiles = append(allPrFiles, prfs...)
+
+	}
+	return allPrFiles, nil
+}
+
+func (m *MaintainerManager) GetFirstPullRequest(state, sortBy string) (*gh.PullRequest, error) {
 	o := &gh.Options{}
 	o.QueryParams = map[string]string{
 		"state":     state,
@@ -117,10 +247,19 @@ func (m *Maintainer) GetFirstPullRequest(state, sortBy string) (*gh.PullRequest,
 }
 
 // Return a single pull request
-// Return pr's comments if requested
-func (m *Maintainer) GetPullRequest(number string, comments bool) (*gh.PullRequest, []gh.Comment, error) {
+func (m *MaintainerManager) GetPullRequest(number string) (*gh.PullRequest, error) {
+	return m.client.PullRequest(m.repo, number, nil)
+}
+
+// Return a single issue
+// Return issue's comments if requested
+func (m *MaintainerManager) GetIssue(number string, comments bool) (*gh.Issue, []gh.Comment, error) {
 	var c []gh.Comment
-	pr, err := m.client.PullRequest(m.repo, number, nil)
+	num, err := strconv.Atoi(number)
+	if err != nil {
+		return nil, nil, err
+	}
+	issue, err := m.client.Issue(m.repo, num, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -130,22 +269,58 @@ func (m *Maintainer) GetPullRequest(number string, comments bool) (*gh.PullReque
 			return nil, nil, err
 		}
 	}
-	return pr, c, nil
+	return issue, c, nil
+}
+
+// Return all issue found
+func (m *MaintainerManager) GetIssuesFound(query string) ([]*gh.SearchItem, error) {
+	o := &gh.Options{}
+	o.QueryParams = map[string]string{
+		"sort":     "updated",
+		"order":    "asc",
+		"per_page": "100",
+	}
+	prevSize := -1
+	page := 1
+	issuesFound := []*gh.SearchItem{}
+	for len(issuesFound) != prevSize {
+		o.QueryParams["page"] = strconv.Itoa(page)
+		if issues, err := m.client.SearchIssues(query, o); err != nil {
+			return nil, err
+		} else {
+			prevSize = len(issuesFound)
+			issuesFound = append(issuesFound, issues...)
+			page += 1
+		}
+		fmt.Printf(".")
+	}
+	return issuesFound, nil
+}
+
+// Return contributors list
+func (m *MaintainerManager) GetContributors() ([]*gh.Contributor, error) {
+	o := &gh.Options{}
+	contributors, err := m.client.Contributors(m.repo, o)
+	if err != nil {
+		return nil, err
+	}
+
+	return contributors, nil
 }
 
 // Return all comments for an issue or pull request
-func (m *Maintainer) GetComments(number string) ([]gh.Comment, error) {
+func (m *MaintainerManager) GetComments(number string) ([]gh.Comment, error) {
 	return m.client.Comments(m.repo, number, nil)
 }
 
 // Add a comment to an existing pull request
-func (m *Maintainer) AddComment(number, comment string) (gh.Comment, error) {
+func (m *MaintainerManager) AddComment(number, comment string) (gh.Comment, error) {
 	return m.client.AddComment(m.repo, number, comment)
 }
 
 // Merge a pull request
 // If no LGTMs are in the comments require force to be true
-func (m *Maintainer) MergePullRequest(number, comment string, force bool) (gh.Merge, error) {
+func (m *MaintainerManager) MergePullRequest(number, comment string, force bool) (gh.Merge, error) {
 	comments, err := m.GetComments(number)
 	if err != nil {
 		return gh.Merge{}, err
@@ -170,25 +345,90 @@ func (m *Maintainer) MergePullRequest(number, comment string, force bool) (gh.Me
 
 // Checkout the pull request into the working tree of
 // the users repository.
-// This will mimic the operations on the manual merge view
-func (m *Maintainer) Checkout(pr *gh.PullRequest) error {
-	var (
-		userBranch        = fmt.Sprintf("%s-%s", pr.User.Login, pr.Head.Ref)
-		destinationBranch = pr.Base.Ref
-	)
-
-	// Checkout a new branch locally before pulling the changes
-	if err := Git("checkout", "-b", userBranch, destinationBranch); err != nil {
-		return err
+//
+// It's up to the caller to decide what to do with the checked out
+// branch - typically created a named branch with 'checkout -b'.
+func (m *MaintainerManager) Checkout(pr *gh.PullRequest) error {
+	if err := Git("fetch", pr.Head.Repo.CloneURL, pr.Head.Ref); err != nil {
+		return fmt.Errorf("git fetch: %v", err)
 	}
-
-	if err := Git("pull", pr.Head.Repo.CloneURL, pr.Head.Ref); err != nil {
-		return err
+	if err := Git("checkout", "FETCH_HEAD"); err != nil {
+		return fmt.Errorf("git checkout: %v", err)
 	}
 	return nil
 }
 
-func (m *Maintainer) GetFirstIssue(state, sortBy string) (*gh.Issue, error) {
+// Get the user information from the authenticated user
+func (m *MaintainerManager) GetGithubUser() (*gh.User, error) {
+	user, err := m.client.User("", nil)
+	if err != nil {
+		return nil, err
+	}
+	return user, err
+}
+
+// Patch an issue
+func (m *MaintainerManager) PatchIssue(number string, issue *gh.Issue) (*gh.Issue, error) {
+	o := &gh.Options{}
+	o.Params = map[string]string{
+		"title":    issue.Title,
+		"body":     issue.Body,
+		"assignee": issue.Assignee.Login,
+	}
+	patchedIssue, err := m.client.PatchIssue(m.repo, number, o)
+	if err != nil {
+		return nil, err
+	}
+	return patchedIssue, err
+}
+
+func (m *MaintainerManager) CreatePullRequest(base, head, title, body string) (*gh.PullRequest, error) {
+	return m.client.CreatePullRequest(
+		m.repo,
+		&gh.Options{
+			Params: map[string]string{
+				"title": title,
+				"head":  head,
+				"base":  base,
+				"body":  body,
+			},
+		},
+	)
+}
+
+// Patch a pull request
+func (m *MaintainerManager) PatchPullRequest(number string, pr *gh.PullRequest) (*gh.PullRequest, error) {
+	o := &gh.Options{}
+	params := map[string]string{
+		"title": pr.Title,
+		"body":  pr.Body,
+	}
+	if pr.Assignee == nil {
+		params["assignee"] = ""
+	} else {
+		params["assignee"] = pr.Assignee.Login
+	}
+	o.Params = params
+	// octokat doesn't expose PatchPullRequest. Use PatchIssue instead.
+	_, err := m.client.PatchIssue(m.repo, number, o)
+	if err != nil {
+		return nil, err
+	}
+	// Simulate the result of the patching
+	patchedPR := *pr
+	return &patchedPR, nil
+}
+
+func (m *MaintainerManager) Close(number string) error {
+	_, err := m.client.PatchIssue(
+		m.repo,
+		number,
+		&gh.Options{Params: map[string]string{"state": "closed"}},
+	)
+	return err
+}
+
+func (m *MaintainerManager) GetFirstIssue(state, sortBy string) (*gh.Issue, error) {
 	o := &gh.Options{}
 	o.QueryParams = map[string]string{
 		"state":     state,
@@ -210,7 +450,7 @@ func (m *Maintainer) GetFirstIssue(state, sortBy string) (*gh.Issue, error) {
 // GetIssues queries the GithubAPI for all issues matching the state `state` and the
 // assignee `assignee`.
 // See http://developer.github.com/v3/issues/#list-issues-for-a-repository
-func (m *Maintainer) GetIssues(state, assignee string) ([]*gh.Issue, error) {
+func (m *MaintainerManager) GetIssues(state, assignee string) ([]*gh.Issue, error) {
 	o := &gh.Options{}
 	o.QueryParams = map[string]string{
 		"sort":      "updated",
@@ -238,4 +478,19 @@ func (m *Maintainer) GetIssues(state, assignee string) ([]*gh.Issue, error) {
 		fmt.Printf(".")
 	}
 	return all, nil
+}
+
+// GenBranchName returns a generated branch name from a human-readable description.
+//
+// For example this:
+//	`GenBranchName("   Hey! let's do awesome stuff...")`
+// Will return this:
+// 	`"hey_let_s_do_awesome_stuff"`
+func GenBranchName(text string) string {
+	toRemove := regexp.MustCompile("(^[[:^alnum:]]+|[[:^alnum:]]$)")
+	toUnderscore := regexp.MustCompile("[[:^alnum:]]+")
+	branchName := strings.ToLower(text)
+	branchName = toRemove.ReplaceAllString(branchName, "")
+	branchName = toUnderscore.ReplaceAllString(branchName, "_")
+	return branchName
 }

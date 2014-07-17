@@ -1,4 +1,4 @@
-package pulls
+package gordon
 
 import (
 	"bufio"
@@ -14,18 +14,25 @@ type remote struct {
 	Url  string
 }
 
-func WriteError(format string, err error) {
-	fmt.Fprintf(os.Stderr, format, err)
+func Fatalf(format string, args ...interface{}) {
+	if !strings.HasSuffix(format, "\n") {
+		format = format + "\n"
+	}
+	fmt.Fprintf(os.Stderr, format, args...)
 	os.Exit(1)
 }
 
 func GetOriginUrl() (string, string, error) {
+	return GetRemoteUrl("origin")
+}
+
+func GetRemoteUrl(remote string) (string, string, error) {
 	remotes, err := getRemotes()
 	if err != nil {
-		return "", "", nil
+		return "", "", err
 	}
 	for _, r := range remotes {
-		if r.Name == "origin" {
+		if r.Name == remote {
 			parts := strings.Split(r.Url, "/")
 
 			org := parts[len(parts)-2]
@@ -40,6 +47,14 @@ func GetOriginUrl() (string, string, error) {
 		}
 	}
 	return "", "", nil
+}
+
+func GetMaintainerManagerEmail() (string, error) {
+	output, err := exec.Command("git", "config", "user.email").Output()
+	if err != nil {
+		return "", fmt.Errorf("git config user.email: %v", err)
+	}
+	return string(bytes.Split(output, []byte("\n"))[0]), err
 }
 
 // Return the remotes for the current dir
@@ -69,4 +84,12 @@ func Git(args ...string) error {
 	cmd.Stdout = os.Stdout
 
 	return cmd.Run()
+}
+
+func GetTopLevelGitRepo() (string, error) {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.Trim(string(out), "\n"), nil
 }
